@@ -1,0 +1,49 @@
+#!/bin/sh
+
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+
+config=tg-ws-proxy-rs
+section=main
+changed=0
+
+# Also normalizes the section type of a config carried over from the releases
+# that named this package's files tg-ws-proxy.
+if [ "$(uci -q get "$config.$section")" != tg-ws-proxy-rs ]; then
+	uci -q set "$config.$section=tg-ws-proxy-rs"
+	changed=1
+fi
+
+secret="$(uci -q get "$config.$section.secret")"
+if [ -z "$secret" ]; then
+	secret="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '1/1 "%02x"')"
+	case "$secret" in
+		????????????????????????????????)
+			uci -q set "$config.$section.secret=$secret"
+			changed=1
+		;;
+	esac
+fi
+
+log_level="$(uci -q get "$config.$section.log_level")"
+if [ -z "$log_level" ]; then
+	quiet="$(uci -q get "$config.$section.quiet")"
+	verbose="$(uci -q get "$config.$section.verbose")"
+	case "$quiet" in 1|true|yes|on) log_level=off ;;
+		*) case "$verbose" in 1|true|yes|on) log_level=debug ;; *) log_level=info ;; esac ;;
+	esac
+	uci -q set "$config.$section.log_level=$log_level"
+	changed=1
+fi
+
+for option in quiet verbose log_file; do
+	if uci -q get "$config.$section.$option" >/dev/null 2>&1; then
+		uci -q delete "$config.$section.$option"
+		changed=1
+	fi
+done
+
+[ "$changed" -eq 0 ] || uci -q commit "$config"
+chmod 0600 "/etc/config/$config"
+rm -f /tmp/luci-indexcache
+rm -rf /tmp/luci-modulecache
+exit 0

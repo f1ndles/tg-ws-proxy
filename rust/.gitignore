@@ -1,0 +1,4 @@
+/target
+/dist
+/openwrt/files/tg-ws-proxy
+.DS_Store

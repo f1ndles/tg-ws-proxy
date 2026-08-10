@@ -1,0 +1,167 @@
+#!/bin/sh /etc/rc.common
+# shellcheck disable=SC2034,SC3043
+
+USE_PROCD=1
+START=90
+STOP=10
+
+NAME="tg-ws-proxy-rs"
+PROG="/usr/bin/tg-ws-proxy-rs"
+CONFIG="tg-ws-proxy-rs"
+SECTION="main"
+
+append_env() {
+	local option="$1"
+	local env_name="$2"
+	local default="${3-}"
+	local value
+
+	config_get value "$SECTION" "$option" "$default"
+	if [ -n "$value" ]; then
+		procd_append_param env "$env_name=$value"
+	fi
+	return 0
+}
+
+append_bool_env() {
+	local option="$1"
+	local env_name="$2"
+	local default="${3-0}"
+	local value
+
+	config_get_bool value "$SECTION" "$option" "$default"
+	if [ "$value" -eq 1 ]; then
+		procd_append_param env "$env_name=true"
+	else
+		procd_append_param env "$env_name=false"
+	fi
+}
+
+append_list_value() {
+	if [ -n "$list_value" ]; then
+		list_value="$list_value,$1"
+	else
+		list_value="$1"
+	fi
+}
+
+append_list_env() {
+	local option="$1"
+	local env_name="$2"
+	local list_value=""
+
+	config_list_foreach "$SECTION" "$option" append_list_value
+	# Preserve compatibility with packages that stored this repeatable value as
+	# a scalar UCI option before it became a DynamicList.
+	if [ -z "$list_value" ]; then
+		config_get list_value "$SECTION" "$option"
+	fi
+	if [ -n "$list_value" ]; then
+		procd_append_param env "$env_name=$list_value"
+	fi
+	return 0
+}
+
+append_dc_ip() {
+	if [ -n "$1" ]; then
+		procd_append_param command --dc-ip "$1"
+	fi
+	return 0
+}
+
+resolve_log_level() {
+	local log_level quiet verbose
+
+	config_get log_level "$SECTION" log_level
+	if [ -z "$log_level" ]; then
+		config_get_bool quiet "$SECTION" quiet 0
+		config_get_bool verbose "$SECTION" verbose 0
+		if [ "$quiet" -eq 1 ]; then
+			log_level=off
+		elif [ "$verbose" -eq 1 ]; then
+			log_level=debug
+		else
+			log_level=info
+		fi
+	fi
+
+	case "$log_level" in
+		off|error|warn|info|debug|trace) printf '%s' "$log_level" ;;
+		*) logger -t "$NAME" "invalid log_level, using info"; printf '%s' info ;;
+	esac
+}
+
+rust_log_filter() {
+	case "$1" in
+		info|debug|trace) printf 'warn,tg_ws_proxy=%s,tg_ws_proxy_rs=%s' "$1" "$1" ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+start_service() {
+	local enabled secret log_level log_filter
+
+	config_load "$CONFIG"
+	config_get_bool enabled "$SECTION" enabled 0
+	[ "$enabled" -eq 1 ] || return 0
+
+	config_get secret "$SECTION" secret
+	if [ -z "$secret" ]; then
+		logger -t "$NAME" "proxy secret is missing; rerun install.sh or set tg-ws-proxy-rs.main.secret"
+		return 1
+	fi
+
+	log_level="$(resolve_log_level)"
+	log_filter="$(rust_log_filter "$log_level")"
+
+	procd_open_instance "$NAME.$SECTION"
+	procd_set_param command "$PROG"
+	config_list_foreach "$SECTION" dc_ip append_dc_ip
+
+	procd_set_param env "TG_SECRET=$secret"
+	procd_append_param env "RUST_LOG=$log_filter"
+	append_env host TG_HOST 0.0.0.0
+	append_env port TG_PORT 1443
+	append_env link_ip TG_LINK_IP
+	append_env listen_faketls_domain TG_LISTEN_FAKETLS_DOMAIN
+	append_env buf_kb TG_BUF_KB 256
+	append_env pool_size TG_POOL_SIZE 4
+	append_env max_connections TG_MAX_CONNECTIONS
+
+	append_list_env mtproto_proxy TG_MTPROTO_PROXY
+	append_list_env cf_domain TG_CF_DOMAIN
+	append_list_env cf_worker_domain TG_CF_WORKER_DOMAIN
+	append_env ws_connect_timeout TG_WS_CONNECT_TIMEOUT 10
+	append_env ws_fail_probe_timeout TG_WS_FAIL_PROBE_TIMEOUT 2
+	append_env ws_fail_cooldown TG_WS_FAIL_COOLDOWN 30
+	append_env ws_redirect_cooldown TG_WS_REDIRECT_COOLDOWN 300
+	append_env ip_fail_cooldown TG_IP_FAIL_COOLDOWN 3600
+	append_env handshake_timeout TG_HANDSHAKE_TIMEOUT 10
+	append_env tcp_fallback_timeout TG_TCP_FALLBACK_TIMEOUT 10
+	append_env upstream_connect_timeout TG_UPSTREAM_CONNECT_TIMEOUT 5
+	append_env upstream_fail_cooldown TG_UPSTREAM_FAIL_COOLDOWN 60
+	append_env cf_connect_timeout TG_CF_CONNECT_TIMEOUT 10
+	append_env cf_fail_cooldown TG_CF_FAIL_COOLDOWN 60
+	append_env fronting_domain TG_FRONTING_DOMAIN
+	append_env fronting_cooldown TG_FRONTING_COOLDOWN 1800
+	append_env fronting_fail_cooldown TG_FRONTING_FAIL_COOLDOWN 60
+	append_env pool_max_age TG_POOL_MAX_AGE 55
+	append_env outbound_proxy TG_OUTBOUND_PROXY
+	append_env no_proxy TG_NO_PROXY
+
+	append_bool_env danger_accept_invalid_certs TG_SKIP_TLS_VERIFY 0
+	append_bool_env cf_priority TG_CF_PRIORITY 0
+	append_bool_env cf_balance TG_CF_BALANCE 0
+	append_bool_env default_domains TG_DEFAULT_DOMAINS 0
+	append_bool_env no_outbound_proxy TG_NO_OUTBOUND_PROXY 0
+
+	procd_set_param file "/etc/config/$CONFIG"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$CONFIG"
+}

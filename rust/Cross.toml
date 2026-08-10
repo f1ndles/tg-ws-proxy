@@ -1,0 +1,14 @@
+# rustc asks the linker for -lunwind on musl targets when link-self-contained is
+# off, but the mips images carry a GCC toolchain, whose unwinder is libgcc_eh.a.
+# Same ABI, different name, so give the linker the name it looks for. Located via
+# -print-file-name rather than a hardcoded path, and dropped next to the original
+# so it lands on a directory the linker already searches.
+[target.mipsel-unknown-linux-musl]
+pre-build = [
+    "L=$(mipsel-linux-muslsf-gcc -print-file-name=libgcc_eh.a) && cp \"$L\" \"$(dirname \"$L\")/libunwind.a\"",
+]
+
+[target.mips-unknown-linux-musl]
+pre-build = [
+    "L=$(mips-linux-muslsf-gcc -print-file-name=libgcc_eh.a) && cp \"$L\" \"$(dirname \"$L\")/libunwind.a\"",
+]

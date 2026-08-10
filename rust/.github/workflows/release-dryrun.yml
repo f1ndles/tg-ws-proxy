@@ -1,0 +1,163 @@
+name: Release dry run
+
+# release.yml only ever runs on `push: tags`, so nothing about it can be tested
+# before a release is already public -- which cost two deleted releases to learn.
+# This workflow rehearses the same work on a pull request or on demand, without
+# a tag and without a public release.
+#
+# It covers the two things that actually broke: building the mips targets, and
+# packing plus running a binary under qemu. The `gh release upload` call, which
+# killed the first attempt, is exercised separately below against a draft
+# release -- a draft does not create the git tag, so nothing leaks even if the
+# cleanup step is skipped.
+
+on:
+    workflow_dispatch:
+    pull_request:
+        paths:
+            - .github/workflows/release.yml
+            - .github/workflows/release-dryrun.yml
+            - .github/scripts/**
+            - Cargo.toml
+            - Cargo.lock
+
+permissions:
+    contents: read
+
+jobs:
+    pack:
+        name: pack ${{ matrix.target }}
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: mipsel-unknown-linux-musl
+                      qemu: qemu-mipsel-static
+                      build_std: true
+                    - target: mips-unknown-linux-musl
+                      qemu: qemu-mips-static
+                      build_std: true
+                    - target: armv7-unknown-linux-musleabihf
+                      qemu: qemu-arm-static
+                    - target: aarch64-unknown-linux-musl
+                      qemu: qemu-aarch64-static
+                    - target: x86_64-unknown-linux-musl
+                      qemu: qemu-x86_64-static
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Install nightly + rust-src
+              if: matrix.build_std
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  components: rust-src
+
+            - name: Install stable Rust
+              if: ${{ !matrix.build_std }}
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Install cross
+              run: cargo install cross --locked
+
+            # release.yml builds the three non-mips targets through
+            # taiki-e/upload-rust-binary-action, which has no hook to pack in the
+            # middle. Building them with `cross` here gives the same profile and
+            # the same target ABI, which is what the packing check needs.
+            - name: Build (build-std)
+              if: matrix.build_std
+              env:
+                  RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
+              run: cross +nightly build --release --bin tg-ws-proxy --target ${{ matrix.target }} -Z build-std=std,panic_abort
+
+            - name: Build
+              if: ${{ !matrix.build_std }}
+              run: cross build --release --bin tg-ws-proxy --target ${{ matrix.target }}
+
+            - name: Install UPX and qemu-user-static
+              env:
+                  UPX_VERSION: 5.2.0
+                  UPX_SHA256: 3db5d3294707439db97866feab8d75d800f028f48481a40547411824da4288a1
+              run: |
+                  set -euxo pipefail
+                  curl -fsSL -o upx.tar.xz \
+                      "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz"
+                  echo "${UPX_SHA256}  upx.tar.xz" | sha256sum -c -
+                  tar -xJf upx.tar.xz
+                  sudo install -m 0755 "upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/upx
+                  sudo apt-get update
+                  sudo apt-get install -y qemu-user-static
+
+            - name: Report how the binary is linked
+              run: |
+                  set -euxo pipefail
+                  BIN="target/${{ matrix.target }}/release/tg-ws-proxy"
+                  file "$BIN"
+                  readelf -d "$BIN" | grep NEEDED || echo "no dynamic dependencies"
+
+            - name: Pack and verify
+              run: |
+                  set -euxo pipefail
+                  .github/scripts/pack-verify.sh \
+                      "target/${{ matrix.target }}/release/tg-ws-proxy" ${{ matrix.qemu }}
+
+            - uses: actions/upload-artifact@v7
+              with:
+                  name: packed-${{ matrix.target }}
+                  path: target/${{ matrix.target }}/release/tg-ws-proxy
+                  if-no-files-found: error
+
+    upload-rehearsal:
+        name: rehearse gh release upload
+        # A fork PR only gets a read-only GITHUB_TOKEN, so this cannot run there.
+        if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            DRY_TAG: dryrun-${{ github.run_id }}
+        steps:
+            - name: Create a draft release
+              run: |
+                  set -euxo pipefail
+                  gh release create "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --draft --title "dry run ${{ github.run_id }}" \
+                      --notes "Throwaway draft from release-dryrun.yml. Safe to delete."
+
+            - name: Upload using the same call release.yml makes
+              run: |
+                  set -euxo pipefail
+                  echo "placeholder" > tg-ws-proxy-dryrun-upx.tar.gz
+                  gh release upload "$DRY_TAG" tg-ws-proxy-dryrun-upx.tar.gz \
+                      --repo "${GITHUB_REPOSITORY}" --clobber
+
+            - name: Confirm the asset actually landed
+              run: |
+                  set -euxo pipefail
+                  gh release view "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --json assets --jq '.assets[].name' | tee assets.txt
+                  grep -q "tg-ws-proxy-dryrun-upx.tar.gz" assets.txt
+
+            # release.yml addresses a draft by tag name in two more places, and
+            # the REST endpoint gh resolves a tag through does not return drafts
+            # -- it relies on gh's fallback over the release list. Exercise both
+            # here so a change in that behaviour surfaces on a pull request and
+            # not on a tag: `compress-assets` downloads the plain asset out of
+            # the still-draft release, and `publish-release` edits it.
+            - name: Confirm a draft can be downloaded from and edited by tag
+              run: |
+                  set -euxo pipefail
+                  gh release download "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --pattern "tg-ws-proxy-dryrun-upx.tar.gz" --dir downloaded
+                  test -s downloaded/tg-ws-proxy-dryrun-upx.tar.gz
+
+                  # Not --draft=false: publishing would create the git tag
+                  # dryrun-<id> in the repository. Any other edit proves the
+                  # same resolution path.
+                  gh release edit "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --title "dry run ${{ github.run_id }} (edited)"
+
+            - name: Delete the draft
+              if: always()
+              run: gh release delete "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" --yes || true

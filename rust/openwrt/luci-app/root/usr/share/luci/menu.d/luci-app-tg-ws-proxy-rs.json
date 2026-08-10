@@ -1,0 +1,14 @@
+{
+	"admin/services/tg-ws-proxy-rs": {
+		"title": "Telegram WS Proxy (Rust)",
+		"order": 80,
+		"action": {
+			"type": "view",
+			"path": "tg-ws-proxy-rs/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-tg-ws-proxy-rs" ],
+			"uci": { "tg-ws-proxy-rs": true }
+		}
+	}
+}

@@ -1,0 +1,328 @@
+name: Release
+
+permissions:
+    contents: write
+
+on:
+    push:
+        tags:
+            - v[0-9]+.*
+
+jobs:
+    # Created as a draft: the assets below take minutes to build, and a
+    # published release with no binaries under it is worse than no release yet.
+    # `publish-release` flips it once every asset has landed.
+    #
+    # The body comes from the notes committed alongside the version bump, so a
+    # release cannot ship with the previous version's text or none at all --
+    # `allow-missing-changelog` stays false, which fails the release instead.
+    # The heading in that file must be a bare `# vX.Y.Z`: parse-changelog does
+    # not recognise a version heading carrying the crate name, with or without
+    # `prefix-format`. The name lives in `title` instead.
+    create-release:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - uses: taiki-e/create-gh-release-action@v1
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
+                  changelog: docs/release-notes/$version.md
+                  title: tg-ws-proxy-rs $tag
+                  draft: true
+
+    upload-assets:
+        needs: create-release
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: aarch64-unknown-linux-musl
+                      os: ubuntu-latest
+                    - target: aarch64-apple-darwin
+                      os: macos-latest
+                    - target: x86_64-unknown-linux-musl
+                      os: ubuntu-latest
+                    - target: mipsel-unknown-linux-musl
+                      os: ubuntu-latest
+                    - target: armv7-unknown-linux-musleabihf
+                      os: ubuntu-latest
+                    - target: x86_64-apple-darwin
+                      os: macos-latest
+                    - target: x86_64-pc-windows-gnu
+                      os: windows-latest
+                    - target: universal-apple-darwin
+                      os: macos-latest
+                    - target: mips-unknown-linux-musl
+                      os: ubuntu-latest
+        runs-on: ${{ matrix.os }}
+        steps:
+            - uses: actions/checkout@v6
+
+            # Default path (all targets except mipsel)
+            - name: Build & upload (default)
+              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
+              uses: taiki-e/upload-rust-binary-action@v1
+              with:
+                  bin: tg-ws-proxy
+                  target: ${{ matrix.target }}
+                  token: ${{ secrets.GITHUB_TOKEN }}
+
+            # Special path for mipsel: nightly + build-std, then upload via gh cli
+            - name: Install nightly + rust-src (mipsel and mips)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  components: rust-src
+
+            - name: Install cross (mipsel and mips)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              run: cargo install cross --locked
+
+            # `crt-static` is not the default on the mips musl targets the way it
+            # is on every other musl target here, and switching it on alone fails:
+            # rustc then names crt1.o/crti.o/crtn.o out of the self-contained
+            # directory that ships with rust-std, which these tier-3 targets do not
+            # have and -Z build-std does not produce. `link-self-contained=no` hands
+            # that job back to gcc, which does have them, and leaves rustc asking
+            # for -lunwind -- the LLVM unwinder, where these images carry GCC's
+            # libgcc_eh.a. Cross.toml aliases the one to the other.
+            #
+            # Without this the binaries need /lib/ld-musl-mips*-sf.so.1 and
+            # libgcc_s.so.1 on the device. OpenWrt has both; other firmware does
+            # not, which is what made this proxy unrunnable there.
+            - name: Build (mipsel, build-std)
+              if: matrix.target == 'mipsel-unknown-linux-musl'
+              env:
+                  RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
+              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
+
+            - name: Build (mips, build-std)
+              if: matrix.target == 'mips-unknown-linux-musl'
+              env:
+                  RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
+              run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl -Z build-std=std,panic_abort
+
+            - name: Inspect build output (mips variants)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              run: |
+                  FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
+                  ls -lah "target/${{ matrix.target }}/release/" || true
+                  test -f "$FILE"
+                  file "$FILE"
+
+                  # Nothing downstream would catch a regression here: a dynamic
+                  # build still runs fine on OpenWrt, which is exactly how this
+                  # shipped unnoticed for as long as it did.
+                  if readelf -d "$FILE" | grep -q NEEDED; then
+                      echo "::error::$FILE is dynamically linked; expected a static binary"
+                      readelf -d "$FILE" | grep NEEDED
+                      exit 1
+                  fi
+
+            - name: Upload to GitHub Release (mips variants)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euxo pipefail
+                  TAG="${GITHUB_REF_NAME}"
+                  NAME="tg-ws-proxy-${{ matrix.target }}"
+                  TMPDIR="$(mktemp -d)"
+                  cp "target/${{ matrix.target }}/release/tg-ws-proxy" "${TMPDIR}/tg-ws-proxy"
+                  tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
+                  gh release upload "$TAG" "${NAME}.tar.gz" --clobber
+
+    openwrt-luci:
+        needs: [create-release, upload-assets, compress-assets]
+        runs-on: ubuntu-latest
+        env:
+            APK_VERSION: 25.12.5
+            APK_SDK_FILE: openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+            APK_SDK_SHA256: ff4a38a397caa2cfe1c39e18f84ddede14878221b3593c3f2c4cfe24e3ec4c25
+            IPK_VERSION: 24.10.5
+            IPK_SDK_FILE: openwrt-sdk-24.10.5-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            IPK_SDK_SHA256: 0fa98c542ee07f1423ebcdce19aed464bc7f8008ef2cbe83cb723ec694ed8c56
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Download and verify OpenWrt SDKs
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  for kind in APK IPK; do
+                      version_var="${kind}_VERSION"
+                      file_var="${kind}_SDK_FILE"
+                      sha_var="${kind}_SDK_SHA256"
+                      version="${!version_var}"
+                      file="${!file_var}"
+                      sha="${!sha_var}"
+                      base="https://downloads.openwrt.org/releases/${version}/targets/mediatek/filogic"
+                      curl -fsSLO "${base}/${file}"
+                      printf '%s  %s\n' "$sha" "$file" | sha256sum -c -
+                      tar --zstd -xf "$file"
+                      sdk_dir="${PWD}/${file%.tar.zst}"
+                      test -f "${sdk_dir}/include/package.mk"
+                      printf 'OPENWRT_%s_SDK=%s\n' "$kind" "$sdk_dir" >> "$GITHUB_ENV"
+                  done
+
+            - name: Build and verify LuCI integration packages
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+                  apk_version="$version"
+                  ipk_version="$version"
+                  case "${GITHUB_REF_NAME}" in
+                      "v${version}") ;;
+                      "v${version}-beta."[1-9]*)
+                          tag_version="${GITHUB_REF_NAME#v}"
+                          beta="${tag_version#"$version-beta."}"
+                          apk_version="${version}_beta${beta}"
+                          ipk_version="${version}~beta.${beta}"
+                      ;;
+                      *) echo "::error::unsupported release tag ${GITHUB_REF_NAME}"; exit 1 ;;
+                  esac
+                  final="${PWD}/dist/openwrt"
+                  rm -rf "$final"
+                  mkdir -p "$final"
+                  openwrt/build-luci-package.sh \
+                      --sdk "$OPENWRT_APK_SDK" \
+                      --version "$apk_version" \
+                      --format apk \
+                      --output "$final"
+                  openwrt/build-luci-package.sh \
+                      --sdk "$OPENWRT_IPK_SDK" \
+                      --version "$ipk_version" \
+                      --format ipk \
+                      --output "$final"
+
+                  (
+                      cd "$final"
+                      set -- luci-app-tg-ws-proxy-rs-*.apk
+                      [[ "$#" -eq 1 && -f "$1" ]]
+                      set -- luci-app-tg-ws-proxy-rs_*.ipk
+                      [[ "$#" -eq 1 && -f "$1" ]]
+                  )
+
+            - name: Build shared release checksums
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  final="${PWD}/dist/openwrt"
+                  gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                      --pattern 'tg-ws-proxy-*-unknown-linux-musl*.tar.gz' --dir "$final"
+                  (
+                      cd "$final"
+                      set -- tg-ws-proxy-*-unknown-linux-musl*.tar.gz
+                      [[ "$#" -eq 10 ]]
+                      sha256sum -- *.tar.gz *.apk *.ipk > SHA256SUMS
+                      sha256sum -c SHA256SUMS
+                  )
+
+            - name: Upload LuCI packages and checksums
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  gh release upload "${GITHUB_REF_NAME}" \
+                      dist/openwrt/luci-app-tg-ws-proxy-rs-*.apk \
+                      dist/openwrt/luci-app-tg-ws-proxy-rs_*.ipk \
+                      dist/openwrt/SHA256SUMS \
+                      --repo "${GITHUB_REPOSITORY}" --clobber
+
+    # Extra UPX-packed assets for flash-constrained devices (OpenWrt routers).
+    #
+    # These do not replace the plain assets: packing trades RAM for flash. A
+    # normal ELF maps its text from the file, so only the working set is
+    # resident and those pages can be evicted under pressure; the UPX stub
+    # decompresses the whole image into anonymous memory instead, which on a
+    # router with no swap stays resident for the life of the process. Good deal
+    # on a 128 MB device with 8 MB of flash, bad one on a 32 MB device — so the
+    # choice belongs to whoever is doing the flashing.
+    #
+    # Windows and macOS are deliberately excluded: UPX-packed PE files trip
+    # antivirus heuristics, which is unacceptable for a censorship-circumvention
+    # tool, and packing a Mach-O invalidates its signature so arm64 macOS
+    # refuses to run it at all.
+    compress-assets:
+        needs: upload-assets
+        # Not `success()`: upload-assets covers Windows and macOS too, and a
+        # hiccup there should not silently drop every `-upx` asset. Each leg
+        # below fails on its own if its plain asset never made it to the release.
+        if: ${{ !cancelled() }}
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: mipsel-unknown-linux-musl
+                      qemu: qemu-mipsel-static
+                    - target: mips-unknown-linux-musl
+                      qemu: qemu-mips-static
+                    - target: armv7-unknown-linux-musleabihf
+                      qemu: qemu-arm-static
+                    - target: aarch64-unknown-linux-musl
+                      qemu: qemu-aarch64-static
+                    - target: x86_64-unknown-linux-musl
+                      qemu: qemu-x86_64-static
+        steps:
+            # Only the scripts are needed, not a full working tree -- but `gh`
+            # also refuses to infer the repository without one, hence --repo on
+            # every gh call below.
+            - uses: actions/checkout@v6
+
+            - name: Install UPX and qemu-user-static
+              env:
+                  UPX_VERSION: 5.2.0
+                  UPX_SHA256: 3db5d3294707439db97866feab8d75d800f028f48481a40547411824da4288a1
+              shell: bash
+              run: |
+                  set -euxo pipefail
+                  curl -fsSL -o upx.tar.xz \
+                      "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz"
+                  echo "${UPX_SHA256}  upx.tar.xz" | sha256sum -c -
+                  tar -xJf upx.tar.xz
+                  sudo install -m 0755 "upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/upx
+                  sudo apt-get update
+                  sudo apt-get install -y qemu-user-static
+
+            - name: Pack, verify and upload
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euxo pipefail
+                  TAG="${GITHUB_REF_NAME}"
+                  NAME="tg-ws-proxy-${{ matrix.target }}"
+                  WORK="$(mktemp -d)"
+
+                  gh release download "$TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --pattern "${NAME}.tar.gz" --dir "$WORK"
+                  tar -C "$WORK" -xzf "${WORK}/${NAME}.tar.gz"
+                  test -f "${WORK}/tg-ws-proxy"
+
+                  .github/scripts/pack-verify.sh "${WORK}/tg-ws-proxy" ${{ matrix.qemu }}
+
+                  tar -C "$WORK" -czf "${NAME}-upx.tar.gz" tg-ws-proxy
+                  gh release upload "$TAG" "${NAME}-upx.tar.gz" \
+                      --repo "${GITHUB_REPOSITORY}" --clobber
+
+    # Every asset job must succeed, so a target or OpenWrt package set that failed
+    # to build leaves the release a draft rather than publishing a half-populated
+    # one. Finish the job by hand (or re-run the failed leg) and the draft is
+    # still there.
+    publish-release:
+        needs: [upload-assets, openwrt-luci, compress-assets]
+        runs-on: ubuntu-latest
+        steps:
+            - name: Publish the draft now that every asset is uploaded
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euxo pipefail
+                  gh release edit "${GITHUB_REF_NAME}" \
+                      --repo "${GITHUB_REPOSITORY}" --draft=false
