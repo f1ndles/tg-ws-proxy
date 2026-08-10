@@ -1,0 +1,8 @@
+id=tg_ws_proxy_f1ndle
+name=TG WS Proxy
+version=23
+versionCode=23
+author=F1NDLE | тгк: F1NDLE_cn
+description=Модуль для обхода замедления Telegram через прокси модуля (MTProto). Кнопка Action открывает Веб интерфейс модуля.
+updateJson=https://raw.githubusercontent.com/F1NDLES/tg_ws_proxy_magisk/refs/heads/main/update.json
+support=https://t.me/F1NDLE_cn
