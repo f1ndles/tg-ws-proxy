@@ -1,1 +1,6 @@
-
+{
+  "version": "23",
+  "versionCode": 23,
+  "zipUrl": "https://github.com/f1ndles/tg-ws-proxy/releases/download/23/tg_ws_proxy_magisk_v23B.zip",
+  "changelog": "https://github.com/f1ndles/tg-ws-proxy/blob/main/CHANGELOG.MD"
+}
