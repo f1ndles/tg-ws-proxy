@@ -41,7 +41,8 @@ SSL/TLS → Overview → **Flexible**
 | CF Balance | Балансировка между CF доменами |
 | DC IP | IP датацентров Telegram |
 
-## Credits
+## Credits (отдельная благодарность)
 
 - [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) — оригинал
 - [valnesfjord/tg-ws-proxy-rs](https://github.com/valnesfjord/tg-ws-proxy-rs) — Rust движок
+- Александр К - многочисленная поддержка проектов
